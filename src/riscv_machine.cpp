@@ -57,6 +57,14 @@
 #include "elf64.h"
 #include "iomem.h"
 
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <errno.h>
+
+
 /* RISCV machine */
 
 //#define DUMP_UART
@@ -1104,6 +1112,108 @@ void virt_machine_set_defaults(VirtMachineParams *p) {
     p->clint_size        = CLINT_SIZE;
 }
 
+#if defined SERVER || defined CLIENT
+FILE *fp;
+// Yuan-Mao
+#define PACKET_PAYLOAD_SIZE 2048
+const unsigned long tx_packet_buf_addr = 0x1000000000UL;
+const unsigned long rx_packet_buf_addr = 0x1000001000UL;
+
+int server_socket_fd, client_socket_fd, socket_fd;
+int tx_packet_size;
+int rx_packet_size;
+unsigned char tx_packet_buf[PACKET_PAYLOAD_SIZE + 4] __attribute__ ((aligned (8)));
+unsigned char rx_packet_buf[PACKET_PAYLOAD_SIZE + 4] __attribute__ ((aligned (8)));
+int packet_is_recv = 0;
+void write_packet(void *opaque, uint32_t offset, uint32_t val, int size_log2)
+{
+	(void)opaque;
+	(void)size_log2;
+	// first 4 bytes belong to packet size field
+	tx_packet_buf[4 + offset] = (unsigned char)val;
+}
+void send_packet(void *opaque, uint32_t UNUSED, uint32_t val, int size_log2)
+{
+	(void)opaque;
+	(void)size_log2;
+	(void)val;
+	(void)UNUSED;
+	int ret, total, remain, offset;
+	*(unsigned *)tx_packet_buf = tx_packet_size;
+
+	total = sizeof(tx_packet_buf);
+	offset = 0;
+	remain = total;
+	fprintf(fp, "send %d:\n", total);
+	while(offset != total) {
+		ret = send(socket_fd, &tx_packet_buf[offset], remain, 0);
+		if(ret == -1) {
+			printf("Dromajo: send falied\n");
+			break;
+		}
+		else {
+			for(int i = 0;i < ret;i++) {
+				fprintf(fp, "%d ", tx_packet_buf[offset + i]);
+			}
+			fprintf(fp, "\n");
+		}
+		offset += ret;
+		remain = total - offset;
+	}
+
+	memset(tx_packet_buf, 0, sizeof(tx_packet_buf));
+}
+void set_tx_packet_size(void *opaque, uint32_t offset, uint32_t val, int size_log2)
+{
+	tx_packet_size = val;
+}
+
+uint32_t read_packet(void *opaque, uint32_t offset, int size_log2)
+{
+	(void)opaque;
+	(void)size_log2;
+	assert(offset < rx_packet_size);
+	return packet_is_recv ? rx_packet_buf[4 + offset] : 0;
+}
+
+uint32_t poll_packet(void *opaque, uint32_t offset, int size_log2)
+{
+	(void)opaque;
+	(void)offset;
+	(void)size_log2;
+	int total = 0, ret, remain;
+	do {
+		remain = sizeof(rx_packet_buf) - total;
+		ret = recv(socket_fd, &rx_packet_buf[total], remain, MSG_DONTWAIT);
+		if(ret == -1) {
+			if(errno != EWOULDBLOCK)
+				printf("Dromajo: recv failed: %d", errno);
+			break;
+		}
+		total += ret;
+	} while(total != sizeof(rx_packet_buf));
+
+	packet_is_recv = (total == sizeof(rx_packet_buf));
+	if(packet_is_recv) {
+		fprintf(fp, "recv %d:\n", total);
+		for(int i = 0;i < total;i++) {
+			if(fprintf(fp, "%d ", rx_packet_buf[i]) < 0)
+				printf("fprintf error\n");
+		}
+		fprintf(fp, "\n");
+		rx_packet_size = *(unsigned *)rx_packet_buf;
+	}
+	return packet_is_recv;
+}
+
+uint32_t get_rx_packet_size(void *opaque, uint32_t offset, int size_log2)
+{
+	return packet_is_recv ? rx_packet_size : 0;
+}
+#endif
+
+
+
 RISCVMachine *virt_machine_init(const VirtMachineParams *p) {
     VIRTIODevice *blk_dev;
     int           irq_num, i;
@@ -1188,6 +1298,77 @@ RISCVMachine *virt_machine_init(const VirtMachineParams *p) {
                         clint_write,
                         DEVIO_SIZE32 | DEVIO_SIZE16 | DEVIO_SIZE8);
     cpu_register_device(s->mem_map, p->plic_base_addr, p->plic_size, s, plic_read, plic_write, DEVIO_SIZE32);
+
+#if defined SERVER || defined CLIENT
+    // Yuan-Mao
+	server_socket_fd = socket(AF_INET , SOCK_STREAM , 0);
+
+	if(server_socket_fd == -1) {
+		fprintf(stderr, "Dromajo: fail to create a socket\n");
+		exit(-1);
+	}
+	#define PORT_NUM    8700
+	struct sockaddr_in serverInfo;
+
+	memset(&serverInfo, 0, sizeof(serverInfo));
+	serverInfo.sin_family = PF_INET;
+	serverInfo.sin_addr.s_addr = INADDR_ANY;
+	serverInfo.sin_port = htons(PORT_NUM);
+#endif
+
+#ifdef SERVER
+	fp = fopen("server_log", "w");
+	if(fp == NULL) {
+		printf("Dromajo: cannot open log file\n");
+		exit(1);
+	}
+	struct sockaddr_in clientInfo;
+	socklen_t addrlen = sizeof(clientInfo);
+	bind(server_socket_fd, (struct sockaddr *)&serverInfo, sizeof(serverInfo));
+	listen(server_socket_fd, 1);
+	printf("Dromajo: Waiting for client to connect\n");
+	client_socket_fd = accept(server_socket_fd, (struct sockaddr*)&clientInfo, &addrlen);
+	if(client_socket_fd == -1) {
+		printf("Dromajo: Fail to accept incoming tcp connection: %d\n", errno);
+		exit(1);
+	}
+	else {
+		printf("Dromajo: Client connected\n");
+	}
+	socket_fd = client_socket_fd;
+#endif
+#ifdef CLIENT
+	fp = fopen("client_log", "w");
+	if(fp == NULL) {
+		printf("Dromajo: cannot open log file\n");
+		exit(1);
+	}
+	if(connect(server_socket_fd, (struct sockaddr *)&serverInfo, sizeof(serverInfo)) == -1) {
+		printf("Dromajo: Client connection error: %d\n", errno);
+		exit(1);
+	}
+	else {
+		printf("Dromajo: Connected to the server\n");
+	}
+	socket_fd = server_socket_fd;
+#endif
+
+#if defined SERVER || defined CLIENT
+	cpu_register_device(s->mem_map, tx_packet_buf_addr,  PACKET_PAYLOAD_SIZE, NULL, 
+			NULL, write_packet, DEVIO_SIZE8);
+	cpu_register_device(s->mem_map, tx_packet_buf_addr + PACKET_PAYLOAD_SIZE, 0x4, NULL, 
+			NULL, set_tx_packet_size, DEVIO_SIZE32);
+	cpu_register_device(s->mem_map, tx_packet_buf_addr + PACKET_PAYLOAD_SIZE + 4, 0x1, NULL, 
+			NULL, send_packet, DEVIO_SIZE8);
+
+	cpu_register_device(s->mem_map, rx_packet_buf_addr,  PACKET_PAYLOAD_SIZE, NULL, 
+			read_packet, NULL, DEVIO_SIZE8);
+	cpu_register_device(s->mem_map, rx_packet_buf_addr + PACKET_PAYLOAD_SIZE, 0x4, NULL, 
+			get_rx_packet_size, NULL, DEVIO_SIZE32);
+	cpu_register_device(s->mem_map, rx_packet_buf_addr + PACKET_PAYLOAD_SIZE + 4, 0x1, NULL, 
+			poll_packet, NULL, DEVIO_SIZE8);
+#endif
+
 
     //BlackParrot Host
     host_init(s);
