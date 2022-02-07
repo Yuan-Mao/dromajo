@@ -567,7 +567,7 @@ static void usage(const char *prog, const char *msg) {
             "       --custom_extension add X extension to isa\n"
             "       --enable_amo enables atomic instructions\n"
             "       --host enable BlackParrot host\n"
-            "       --checkpoint_period creates a checkpoint evey N instructions\n",
+            "       --checkpoint_period creates a checkpoint evey N instructions\n"
             "       --clear_ids clear mvendorid, marchid, mimpid for all cores\n",
             msg,
             CONFIG_VERSION,
